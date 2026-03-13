@@ -25,64 +25,112 @@ info "Checking prerequisites..."
 
 [[ $EUID -eq 0 ]] || error "This script must be run as root (use sudo ./install.sh)"
 
-command -v curl  >/dev/null 2>&1 || error "curl is required but not installed"
-command -v tar   >/dev/null 2>&1 || error "tar is required but not installed"
-command -v jq    >/dev/null 2>&1 || { warn "jq not found, installing..."; apt-get install -y jq || yum install -y jq || error "Failed to install jq"; }
 command -v systemctl >/dev/null 2>&1 || error "systemd is required but not found"
 
-# ─── Detect architecture ─────────────────────────────────────────────────────
-ARCH=$(uname -m)
-case "$ARCH" in
-    x86_64)  ASSET_PATTERN="x86_64-unknown-linux-gnu" ;;
-    aarch64) ASSET_PATTERN="aarch64-unknown-linux-gnu" ;;
-    *)       error "Unsupported architecture: $ARCH" ;;
-esac
+# ─── Detect install strategy ─────────────────────────────────────────────────
+# If we're inside the repo (Cargo.toml exists), build from source.
+# Otherwise, download the latest release from GitHub.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/Cargo.toml" ]]; then
+    INSTALL_MODE="source"
+    info "Detected local repo at $SCRIPT_DIR — will build from source"
+else
+    INSTALL_MODE="release"
+    info "No local repo detected — will download latest release"
+fi
 
-info "Detected architecture: $ARCH ($ASSET_PATTERN)"
+# ─── Resolve auth path for the real user (not root) ──────────────────────────
+if [[ -n "${SUDO_USER:-}" ]]; then
+    REAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    AUTH_PATH="$REAL_HOME/.codex/auth.json"
+fi
 
-# ─── Fetch latest release ────────────────────────────────────────────────────
-info "Fetching latest release from github.com/$REPO..."
+# ─── Strategy: build from source ─────────────────────────────────────────────
+install_from_source() {
+    command -v cargo >/dev/null 2>&1 || error "cargo (Rust toolchain) is required to build from source. Install via https://rustup.rs"
 
-RELEASE_JSON=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest") \
-    || error "Failed to fetch release info. Check your network and that the repo has releases."
+    info "Building release binary..."
+    cd "$SCRIPT_DIR"
 
-TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
-DOWNLOAD_URL=$(echo "$RELEASE_JSON" | jq -r ".assets[] | select(.name | contains(\"$ASSET_PATTERN\")) | .browser_download_url")
+    # Build as the real user to avoid permission issues with cargo cache
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        sudo -u "$SUDO_USER" cargo build --release
+    else
+        cargo build --release
+    fi
 
-[[ -n "$TAG" && "$TAG" != "null" ]]             || error "Could not determine latest release tag"
-[[ -n "$DOWNLOAD_URL" && "$DOWNLOAD_URL" != "null" ]] || error "No release asset found for $ASSET_PATTERN in $TAG"
+    local BUILT_BINARY="$SCRIPT_DIR/target/release/$BINARY_NAME"
+    [[ -f "$BUILT_BINARY" ]] || error "Build succeeded but binary not found at $BUILT_BINARY"
 
-info "Latest release: $TAG"
-info "Download URL: $DOWNLOAD_URL"
+    info "Installing binary to $INSTALL_DIR/$BINARY_NAME..."
+    install -m 755 "$BUILT_BINARY" "$INSTALL_DIR/$BINARY_NAME"
 
-# ─── Download & install binary ───────────────────────────────────────────────
-TMP_DIR=$(mktemp -d)
-trap 'rm -rf "$TMP_DIR"' EXIT
+    TAG="source ($(git -C "$SCRIPT_DIR" describe --tags --always 2>/dev/null || echo "local"))"
+}
 
-info "Downloading $TAG..."
-curl -fsSL "$DOWNLOAD_URL" -o "$TMP_DIR/release.tar.gz"
+# ─── Strategy: download release ──────────────────────────────────────────────
+install_from_release() {
+    command -v curl >/dev/null 2>&1 || error "curl is required but not installed"
+    command -v tar  >/dev/null 2>&1 || error "tar is required but not installed"
+    command -v jq   >/dev/null 2>&1 || { warn "jq not found, installing..."; apt-get install -y jq || pacman -S --noconfirm jq || yum install -y jq || error "Failed to install jq"; }
 
-info "Extracting..."
-tar xzf "$TMP_DIR/release.tar.gz" -C "$TMP_DIR"
+    # Detect architecture
+    local ARCH
+    ARCH=$(uname -m)
+    local ASSET_PATTERN
+    case "$ARCH" in
+        x86_64)  ASSET_PATTERN="x86_64-unknown-linux-gnu" ;;
+        aarch64) ASSET_PATTERN="aarch64-unknown-linux-gnu" ;;
+        *)       error "Unsupported architecture: $ARCH" ;;
+    esac
+    info "Detected architecture: $ARCH ($ASSET_PATTERN)"
 
-# Find the binary (might be in a subdirectory)
-BINARY_PATH=$(find "$TMP_DIR" -name "$BINARY_NAME" -type f | head -1)
-[[ -n "$BINARY_PATH" ]] || error "Binary '$BINARY_NAME' not found in the archive"
+    info "Fetching latest release from github.com/$REPO..."
+    local RELEASE_JSON
+    RELEASE_JSON=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest") \
+        || error "Failed to fetch release info. Check your network and that the repo has releases."
 
-info "Installing binary to $INSTALL_DIR/$BINARY_NAME..."
-install -m 755 "$BINARY_PATH" "$INSTALL_DIR/$BINARY_NAME"
+    TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+    local DOWNLOAD_URL
+    DOWNLOAD_URL=$(echo "$RELEASE_JSON" | jq -r ".assets[] | select(.name | contains(\"$ASSET_PATTERN\")) | .browser_download_url")
+
+    [[ -n "$TAG" && "$TAG" != "null" ]]                    || error "Could not determine latest release tag"
+    [[ -n "$DOWNLOAD_URL" && "$DOWNLOAD_URL" != "null" ]]  || error "No release asset found for $ASSET_PATTERN in $TAG"
+
+    info "Latest release: $TAG"
+    info "Download URL: $DOWNLOAD_URL"
+
+    local TMP_DIR
+    TMP_DIR=$(mktemp -d)
+    trap 'rm -rf "$TMP_DIR"' EXIT
+
+    info "Downloading $TAG..."
+    curl -fsSL "$DOWNLOAD_URL" -o "$TMP_DIR/release.tar.gz"
+
+    info "Extracting..."
+    tar xzf "$TMP_DIR/release.tar.gz" -C "$TMP_DIR"
+
+    local BINARY_PATH
+    BINARY_PATH=$(find "$TMP_DIR" -name "$BINARY_NAME" -type f | head -1)
+    [[ -n "$BINARY_PATH" ]] || error "Binary '$BINARY_NAME' not found in the archive"
+
+    info "Installing binary to $INSTALL_DIR/$BINARY_NAME..."
+    install -m 755 "$BINARY_PATH" "$INSTALL_DIR/$BINARY_NAME"
+}
+
+# ─── Run the chosen strategy ─────────────────────────────────────────────────
+TAG="unknown"
+if [[ "$INSTALL_MODE" == "source" ]]; then
+    install_from_source
+else
+    install_from_release
+fi
 
 # Verify it runs
 "$INSTALL_DIR/$BINARY_NAME" --version && info "Binary installed successfully" \
     || error "Binary installed but failed to execute"
 
 # ─── Check auth.json ─────────────────────────────────────────────────────────
-# Resolve ~ for the user who invoked sudo
-if [[ -n "${SUDO_USER:-}" ]]; then
-    REAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
-    AUTH_PATH="$REAL_HOME/.codex/auth.json"
-fi
-
 if [[ -f "$AUTH_PATH" ]]; then
     info "Auth file found: $AUTH_PATH"
     # Validate it has the expected structure
