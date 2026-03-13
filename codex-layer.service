@@ -1,0 +1,23 @@
+[Unit]
+Description=Codex Layer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/codex-openai-proxy --port 18080
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ReadOnlyPaths=/
+
+[Install]
+WantedBy=multi-user.target

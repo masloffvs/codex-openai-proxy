@@ -29,14 +29,38 @@ All requests and responses are transparently converted between the two formats. 
 
 ## Installation
 
-### Pre-built Binaries
+### Quick Install (Linux, systemd)
+
+One command to download the latest release, install the binary, and set up a systemd service on port 18080:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/masloffvs/codex-openai-proxy/main/install.sh | sudo bash
+```
+
+Or clone and run locally:
+
+```bash
+git clone https://github.com/masloffvs/codex-openai-proxy.git
+cd codex-openai-proxy
+sudo ./install.sh
+```
+
+After install:
+
+```bash
+systemctl status  codex-layer   # check status
+journalctl -fu    codex-layer   # view logs
+curl http://localhost:18080/v1/models   # test
+```
+
+### Pre-built Binaries (manual)
 
 Linux x86_64:
 
 ```bash
 curl -fsSL https://github.com/masloffvs/codex-openai-proxy/releases/latest/download/codex-openai-proxy-x86_64-unknown-linux-gnu.tar.gz | tar -xz
 chmod +x ./codex-openai-proxy
-./codex-openai-proxy --port 8888 --auth-path ~/.codex/auth.json
+./codex-openai-proxy --port 18080 --auth-path ~/.codex/auth.json
 ```
 
 macOS and Windows binaries are available on the [releases page](https://github.com/masloffvs/codex-openai-proxy/releases/latest). Release assets are published automatically for tags matching `v*`.
