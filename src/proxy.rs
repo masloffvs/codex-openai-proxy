@@ -6,7 +6,8 @@ use uuid::Uuid;
 
 use crate::types::{
     AuthData, ChatCompletionsRequest, ChatCompletionsResponse, ChatResponseMessage, Choice,
-    ContentItem, ModelInfo, ModelsListResponse, ResponseItem, ResponsesApiRequest, Usage,
+    ContentItem, ModelInfo, ModelsListResponse, ResponseItem, ResponsesApiRequest, ToolCall,
+    ToolCallFunction, Usage,
 };
 
 const CODEX_CLIENT_VERSION: &str = "1.0.0";
@@ -330,6 +331,11 @@ impl ProxyServer {
 
         let mut response_content = String::new();
         let mut saw_output_text_delta = false;
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        // Track the current function call being built from deltas
+        let mut current_fc_name: Option<String> = None;
+        let mut current_fc_call_id: Option<String> = None;
+        let mut current_fc_args = String::new();
         let response_text = response.text().await?;
 
         debug!(
@@ -363,53 +369,166 @@ impl ProxyServer {
                                     response_content.push_str(delta);
                                 }
                             }
-                            "response.output_item.done" => {
-                                if saw_output_text_delta {
-                                    continue;
-                                }
-
+                            "response.output_item.added" => {
+                                // A new output item is starting — could be a function_call
                                 if let Some(item) = event.get("item") {
-                                    if let Some(content_items) =
-                                        item.get("content").and_then(|value| value.as_array())
-                                    {
-                                        for content_item in content_items {
-                                            if let Some(text) = content_item
-                                                .get("text")
-                                                .and_then(|value| value.as_str())
-                                            {
-                                                response_content.push_str(text);
+                                    let item_type =
+                                        item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                    if item_type == "function_call" {
+                                        current_fc_name = item
+                                            .get("name")
+                                            .and_then(|v| v.as_str())
+                                            .map(String::from);
+                                        current_fc_call_id = item
+                                            .get("call_id")
+                                            .and_then(|v| v.as_str())
+                                            .map(String::from);
+                                        current_fc_args.clear();
+                                        debug!(
+                                            target: "proxy",
+                                            "backend.sse.function_call.start name={:?} call_id={:?}",
+                                            current_fc_name,
+                                            current_fc_call_id
+                                        );
+                                    }
+                                }
+                            }
+                            "response.function_call_arguments.delta" => {
+                                if let Some(delta) =
+                                    event.get("delta").and_then(|value| value.as_str())
+                                {
+                                    current_fc_args.push_str(delta);
+                                }
+                            }
+                            "response.function_call_arguments.done" => {
+                                // Full arguments available
+                                if let Some(args) = event.get("arguments").and_then(|v| v.as_str())
+                                {
+                                    current_fc_args = args.to_string();
+                                }
+                            }
+                            "response.output_item.done" => {
+                                if let Some(item) = event.get("item") {
+                                    let item_type =
+                                        item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+                                    if item_type == "function_call" {
+                                        // Finalize function call
+                                        let name = item
+                                            .get("name")
+                                            .and_then(|v| v.as_str())
+                                            .or(current_fc_name.as_deref())
+                                            .unwrap_or("unknown")
+                                            .to_string();
+                                        let call_id = item
+                                            .get("call_id")
+                                            .and_then(|v| v.as_str())
+                                            .or(current_fc_call_id.as_deref())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let arguments = item
+                                            .get("arguments")
+                                            .and_then(|v| v.as_str())
+                                            .map(String::from)
+                                            .unwrap_or_else(|| current_fc_args.clone());
+
+                                        info!(
+                                            target: "proxy",
+                                            "backend.sse.function_call.done name={} call_id={} args_len={}",
+                                            name,
+                                            call_id,
+                                            arguments.len()
+                                        );
+
+                                        tool_calls.push(ToolCall {
+                                            id: call_id,
+                                            call_type: "function".to_string(),
+                                            function: ToolCallFunction { name, arguments },
+                                        });
+
+                                        // Reset for next potential function call
+                                        current_fc_name = None;
+                                        current_fc_call_id = None;
+                                        current_fc_args.clear();
+                                    } else if item_type == "message" && !saw_output_text_delta {
+                                        // Text message fallback
+                                        if let Some(content_items) =
+                                            item.get("content").and_then(|v| v.as_array())
+                                        {
+                                            for content_item in content_items {
+                                                if let Some(text) = content_item
+                                                    .get("text")
+                                                    .and_then(|v| v.as_str())
+                                                {
+                                                    response_content.push_str(text);
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
                             "response.completed" => {
-                                // Fallback: extract text from the completed response object
-                                if response_content.is_empty() {
+                                // Fallback: extract from completed response
+                                if response_content.is_empty() && tool_calls.is_empty() {
                                     if let Some(resp) = event.get("response") {
                                         if let Some(output) =
                                             resp.get("output").and_then(|v| v.as_array())
                                         {
                                             for item in output {
-                                                if let Some(content) =
-                                                    item.get("content").and_then(|v| v.as_array())
-                                                {
-                                                    for c in content {
-                                                        if let Some(text) =
-                                                            c.get("text").and_then(|v| v.as_str())
-                                                        {
-                                                            response_content.push_str(text);
+                                                let item_type = item
+                                                    .get("type")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("");
+
+                                                if item_type == "function_call" {
+                                                    let name = item
+                                                        .get("name")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("unknown")
+                                                        .to_string();
+                                                    let call_id = item
+                                                        .get("call_id")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("")
+                                                        .to_string();
+                                                    let arguments = item
+                                                        .get("arguments")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("{}")
+                                                        .to_string();
+
+                                                    tool_calls.push(ToolCall {
+                                                        id: call_id,
+                                                        call_type: "function".to_string(),
+                                                        function: ToolCallFunction {
+                                                            name,
+                                                            arguments,
+                                                        },
+                                                    });
+                                                } else if item_type == "message" {
+                                                    if let Some(content) = item
+                                                        .get("content")
+                                                        .and_then(|v| v.as_array())
+                                                    {
+                                                        for c in content {
+                                                            if let Some(text) = c
+                                                                .get("text")
+                                                                .and_then(|v| v.as_str())
+                                                            {
+                                                                response_content.push_str(text);
+                                                            }
                                                         }
                                                     }
                                                 }
                                             }
                                         }
                                     }
-                                    if !response_content.is_empty() {
+                                    if !response_content.is_empty() || !tool_calls.is_empty() {
                                         info!(
                                             target: "proxy",
-                                            "backend.sse.fallback extracted from response.completed chars={}",
-                                            response_content.len()
+                                            "backend.sse.fallback from response.completed text={} tool_calls={}",
+                                            response_content.len(),
+                                            tool_calls.len()
                                         );
                                     }
                                 }
@@ -421,7 +540,7 @@ impl ProxyServer {
             }
         }
 
-        if response_content.is_empty() {
+        if response_content.is_empty() && tool_calls.is_empty() {
             warn!(
                 target: "proxy",
                 "backend.response_empty model={} sse_bytes={}",
@@ -432,14 +551,31 @@ impl ProxyServer {
 
         info!(
             target: "proxy",
-            "backend.response_ok model={} content_chars={}",
+            "backend.response_ok model={} content_chars={} tool_calls={}",
             responses_req.model,
-            response_content.chars().count()
+            response_content.chars().count(),
+            tool_calls.len()
         );
+
+        let finish_reason = if tool_calls.is_empty() {
+            "stop"
+        } else {
+            "tool_calls"
+        };
 
         Ok(build_chat_response(
             responses_req.model.clone(),
-            response_content,
+            if response_content.is_empty() {
+                None
+            } else {
+                Some(response_content)
+            },
+            if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls)
+            },
+            finish_reason.to_string(),
             Usage {
                 prompt_tokens: 0,
                 completion_tokens: 0,
@@ -458,7 +594,13 @@ fn resolve_auth_path(auth_path: &str) -> Result<String> {
     }
 }
 
-fn build_chat_response(model: String, content: String, usage: Usage) -> ChatCompletionsResponse {
+fn build_chat_response(
+    model: String,
+    content: Option<String>,
+    tool_calls: Option<Vec<ToolCall>>,
+    finish_reason: String,
+    usage: Usage,
+) -> ChatCompletionsResponse {
     ChatCompletionsResponse {
         id: format!("chatcmpl-{}", Uuid::new_v4()),
         object: "chat.completion".to_string(),
@@ -469,8 +611,9 @@ fn build_chat_response(model: String, content: String, usage: Usage) -> ChatComp
             message: ChatResponseMessage {
                 role: "assistant".to_string(),
                 content,
+                tool_calls,
             },
-            finish_reason: Some("stop".to_string()),
+            finish_reason: Some(finish_reason),
         }],
         usage: Some(usage),
     }

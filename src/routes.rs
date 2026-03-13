@@ -170,7 +170,9 @@ async fn handle_chat_request(
                 let content_preview = response
                     .choices
                     .first()
-                    .map(|choice| truncate_for_log(&choice.message.content, 100))
+                    .map(|choice| {
+                        truncate_for_log(choice.message.content.as_deref().unwrap_or(""), 100)
+                    })
                     .unwrap_or_default();
 
                 info!(
@@ -285,33 +287,90 @@ fn preview_content(content: &Value) -> String {
 }
 
 fn build_streaming_response(response: &ChatCompletionsResponse) -> warp::reply::Response {
-    let message = response
-        .choices
-        .first()
-        .map(|choice| choice.message.content.as_str())
-        .unwrap_or("");
-    let finish_reason = response
-        .choices
-        .first()
-        .and_then(|choice| choice.finish_reason.as_deref())
+    let choice = response.choices.first();
+    let finish_reason = choice
+        .and_then(|c| c.finish_reason.as_deref())
         .unwrap_or("stop");
 
-    let sse_chunks = [
-        format!(
-            "data: {}\n\n",
-            json!({
-                "id": response.id,
-                "object": "chat.completion.chunk",
-                "created": response.created,
-                "model": response.model,
-                "choices": [{
-                    "index": 0,
-                    "delta": { "role": "assistant" },
-                    "finish_reason": null
-                }]
-            })
-        ),
-        format!(
+    let has_tool_calls = choice
+        .and_then(|c| c.message.tool_calls.as_ref())
+        .map_or(false, |tc| !tc.is_empty());
+
+    let mut chunks = Vec::new();
+
+    // Role chunk
+    chunks.push(format!(
+        "data: {}\n\n",
+        json!({
+            "id": response.id,
+            "object": "chat.completion.chunk",
+            "created": response.created,
+            "model": response.model,
+            "choices": [{
+                "index": 0,
+                "delta": { "role": "assistant" },
+                "finish_reason": null
+            }]
+        })
+    ));
+
+    if has_tool_calls {
+        let tool_calls = choice.unwrap().message.tool_calls.as_ref().unwrap();
+        for (idx, tc) in tool_calls.iter().enumerate() {
+            // First chunk: tool call with function name
+            chunks.push(format!(
+                "data: {}\n\n",
+                json!({
+                    "id": response.id,
+                    "object": "chat.completion.chunk",
+                    "created": response.created,
+                    "model": response.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": idx,
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": ""
+                                }
+                            }]
+                        },
+                        "finish_reason": null
+                    }]
+                })
+            ));
+            // Second chunk: arguments
+            chunks.push(format!(
+                "data: {}\n\n",
+                json!({
+                    "id": response.id,
+                    "object": "chat.completion.chunk",
+                    "created": response.created,
+                    "model": response.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": idx,
+                                "function": {
+                                    "arguments": tc.function.arguments
+                                }
+                            }]
+                        },
+                        "finish_reason": null
+                    }]
+                })
+            ));
+        }
+    } else {
+        // Content chunk
+        let message = choice
+            .and_then(|c| c.message.content.as_deref())
+            .unwrap_or("");
+        chunks.push(format!(
             "data: {}\n\n",
             json!({
                 "id": response.id,
@@ -324,26 +383,30 @@ fn build_streaming_response(response: &ChatCompletionsResponse) -> warp::reply::
                     "finish_reason": null
                 }]
             })
-        ),
-        format!(
-            "data: {}\n\n",
-            json!({
-                "id": response.id,
-                "object": "chat.completion.chunk",
-                "created": response.created,
-                "model": response.model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": finish_reason
-                }]
-            })
-        ),
-        "data: [DONE]\n\n".to_string(),
-    ]
-    .join("");
+        ));
+    }
 
-    let reply = warp::reply::with_header(sse_chunks, "content-type", "text/event-stream");
+    // Finish chunk
+    chunks.push(format!(
+        "data: {}\n\n",
+        json!({
+            "id": response.id,
+            "object": "chat.completion.chunk",
+            "created": response.created,
+            "model": response.model,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": finish_reason
+            }]
+        })
+    ));
+
+    chunks.push("data: [DONE]\n\n".to_string());
+
+    let sse_body = chunks.join("");
+
+    let reply = warp::reply::with_header(sse_body, "content-type", "text/event-stream");
     let reply = warp::reply::with_header(reply, "cache-control", "no-cache");
     let reply = warp::reply::with_header(reply, "connection", "keep-alive");
     reply.into_response()
