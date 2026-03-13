@@ -93,11 +93,50 @@ impl ProxyServer {
             input.len()
         );
 
+        // Convert tools from Chat Completions format to Responses API format
+        // Chat: {type: "function", function: {name, description, parameters}}
+        // Responses: {type: "function", name, description, parameters}
+        let tools: Vec<Value> = chat_req
+            .tools
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|tool| {
+                let obj = tool.as_object()?;
+                let tool_type = obj.get("type")?.as_str()?.to_string();
+                if tool_type == "function" {
+                    let func = obj.get("function")?.as_object()?;
+                    let mut converted = serde_json::Map::new();
+                    converted.insert("type".to_string(), Value::String(tool_type));
+                    if let Some(name) = func.get("name") {
+                        converted.insert("name".to_string(), name.clone());
+                    }
+                    if let Some(desc) = func.get("description") {
+                        converted.insert("description".to_string(), desc.clone());
+                    }
+                    if let Some(params) = func.get("parameters") {
+                        converted.insert("parameters".to_string(), params.clone());
+                    }
+                    if let Some(strict) = func.get("strict") {
+                        converted.insert("strict".to_string(), strict.clone());
+                    }
+                    Some(Value::Object(converted))
+                } else {
+                    Some(tool)
+                }
+            })
+            .collect();
+
+        info!(
+            target: "proxy",
+            "convert.tools count={}",
+            tools.len()
+        );
+
         ResponsesApiRequest {
             model: chat_req.model,
             instructions,
             input,
-            tools: chat_req.tools.unwrap_or_default(),
+            tools,
             tool_choice: "auto".to_string(),
             parallel_tool_calls: false,
             reasoning: None,
