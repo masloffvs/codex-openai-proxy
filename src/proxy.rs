@@ -332,14 +332,28 @@ impl ProxyServer {
         let mut saw_output_text_delta = false;
         let response_text = response.text().await?;
 
+        debug!(
+            target: "proxy",
+            "backend.sse.raw length={} first_500={}",
+            response_text.len(),
+            truncate_for_log(&response_text, 500)
+        );
+
         for line in response_text.lines() {
             if let Some(json_data) = line.strip_prefix("data: ") {
                 if json_data == "[DONE]" {
+                    debug!(target: "proxy", "backend.sse.done");
                     break;
                 }
 
                 if let Ok(event) = serde_json::from_str::<serde_json::Value>(json_data) {
                     if let Some(event_type) = event.get("type").and_then(|value| value.as_str()) {
+                        debug!(
+                            target: "proxy",
+                            "backend.sse.event type={}",
+                            event_type
+                        );
+
                         match event_type {
                             "response.output_text.delta" => {
                                 if let Some(delta) =
@@ -369,6 +383,37 @@ impl ProxyServer {
                                     }
                                 }
                             }
+                            "response.completed" => {
+                                // Fallback: extract text from the completed response object
+                                if response_content.is_empty() {
+                                    if let Some(resp) = event.get("response") {
+                                        if let Some(output) =
+                                            resp.get("output").and_then(|v| v.as_array())
+                                        {
+                                            for item in output {
+                                                if let Some(content) =
+                                                    item.get("content").and_then(|v| v.as_array())
+                                                {
+                                                    for c in content {
+                                                        if let Some(text) =
+                                                            c.get("text").and_then(|v| v.as_str())
+                                                        {
+                                                            response_content.push_str(text);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if !response_content.is_empty() {
+                                        info!(
+                                            target: "proxy",
+                                            "backend.sse.fallback extracted from response.completed chars={}",
+                                            response_content.len()
+                                        );
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -379,10 +424,10 @@ impl ProxyServer {
         if response_content.is_empty() {
             warn!(
                 target: "proxy",
-                "backend.response_empty model={}",
-                responses_req.model
+                "backend.response_empty model={} sse_bytes={}",
+                responses_req.model,
+                response_text.len()
             );
-            response_content = "I apologize, but I couldn't process your request due to a backend API format issue. The proxy is receiving your request correctly but needs format refinement.".to_string();
         }
 
         info!(
