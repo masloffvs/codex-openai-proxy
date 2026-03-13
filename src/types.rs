@@ -30,7 +30,26 @@ pub struct ChatCompletionsRequest {
 #[derive(Deserialize, Debug, Clone)]
 pub struct ChatMessage {
     pub role: String,
+    #[serde(default)]
     pub content: Value,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<ChatMessageToolCall>>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct ChatMessageToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: Option<String>,
+    pub function: ChatMessageToolCallFunction,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct ChatMessageToolCallFunction {
+    pub name: String,
+    pub arguments: String,
 }
 
 #[derive(Serialize, Debug)]
@@ -102,6 +121,17 @@ pub enum ResponseItem {
         id: Option<String>,
         role: String,
         content: Vec<ContentItem>,
+    },
+    FunctionCall {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
+    FunctionCallOutput {
+        call_id: String,
+        output: String,
     },
 }
 

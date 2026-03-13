@@ -36,37 +36,73 @@ impl ProxyServer {
         Ok(Self { client, auth_data })
     }
 
+    fn extract_content_text(content: &Value) -> String {
+        match content {
+            Value::String(text) => text.clone(),
+            Value::Array(items) => items
+                .iter()
+                .filter_map(|item| {
+                    if let Some(object) = item.as_object() {
+                        object
+                            .get("text")
+                            .and_then(|text| text.as_str())
+                            .map(ToOwned::to_owned)
+                    } else {
+                        item.as_str().map(ToOwned::to_owned)
+                    }
+                })
+                .collect::<Vec<String>>()
+                .join(" "),
+            Value::Null => String::new(),
+            _ => content.to_string(),
+        }
+    }
+
     fn convert_chat_to_responses(&self, chat_req: ChatCompletionsRequest) -> ResponsesApiRequest {
         let mut input = Vec::new();
         let mut system_parts: Vec<String> = Vec::new();
 
         for msg in chat_req.messages {
-            let content_text = match &msg.content {
-                Value::String(text) => text.clone(),
-                Value::Array(items) => items
-                    .iter()
-                    .filter_map(|item| {
-                        if let Some(object) = item.as_object() {
-                            object
-                                .get("text")
-                                .and_then(|text| text.as_str())
-                                .map(ToOwned::to_owned)
-                        } else {
-                            item.as_str().map(ToOwned::to_owned)
-                        }
-                    })
-                    .collect::<Vec<String>>()
-                    .join(" "),
-                _ => msg.content.to_string(),
-            };
-
             // System messages go into `instructions`, not `input`
             if msg.role == "system" || msg.role == "developer" {
+                let content_text = Self::extract_content_text(&msg.content);
                 if !content_text.is_empty() {
                     system_parts.push(content_text);
                 }
                 continue;
             }
+
+            // Tool result messages → function_call_output
+            if msg.role == "tool" {
+                if let Some(tool_call_id) = &msg.tool_call_id {
+                    let output = Self::extract_content_text(&msg.content);
+                    input.push(ResponseItem::FunctionCallOutput {
+                        call_id: tool_call_id.clone(),
+                        output,
+                    });
+                    continue;
+                }
+            }
+
+            // Assistant messages with tool_calls → function_call items
+            if msg.role == "assistant" {
+                if let Some(tool_calls) = &msg.tool_calls {
+                    if !tool_calls.is_empty() {
+                        for tc in tool_calls {
+                            input.push(ResponseItem::FunctionCall {
+                                id: None,
+                                call_id: tc.id.clone(),
+                                name: tc.function.name.clone(),
+                                arguments: tc.function.arguments.clone(),
+                            });
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            // Regular user/assistant messages
+            let content_text = Self::extract_content_text(&msg.content);
 
             let content_item = if msg.role == "assistant" {
                 ContentItem::OutputText { text: content_text }
