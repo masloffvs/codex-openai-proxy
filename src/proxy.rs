@@ -67,10 +67,16 @@ impl ProxyServer {
                 continue;
             }
 
+            let content_item = if msg.role == "assistant" {
+                ContentItem::OutputText { text: content_text }
+            } else {
+                ContentItem::InputText { text: content_text }
+            };
+
             input.push(ResponseItem::Message {
                 id: None,
                 role: msg.role,
-                content: vec![ContentItem::InputText { text: content_text }],
+                content: vec![content_item],
             });
         }
 

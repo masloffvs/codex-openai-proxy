@@ -92,6 +92,7 @@ pub enum ResponseItem {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentItem {
     InputText { text: String },
+    OutputText { text: String },
 }
 
 #[derive(Deserialize, Debug, Clone)]
