@@ -1,55 +1,146 @@
 # Codex OpenAI Proxy
 
-A proxy server that allows CLINE (Claude Code) and other OpenAI-compatible extensions to use ChatGPT Plus tokens from Codex authentication instead of requiring separate OpenAI API keys.
+A reverse proxy that translates OpenAI Chat Completions API requests into ChatGPT Responses API calls, enabling tools like CLINE to work with ChatGPT Plus accounts.
 
-## Overview
+## Architecture
 
-This proxy bridges the gap between:
-- **Input**: Standard OpenAI Chat Completions API format (what CLINE expects)
-- **Output**: ChatGPT Responses API format (what ChatGPT backend uses)
+The proxy sits between any OpenAI-compatible client and the ChatGPT backend:
+
+```
+Client (CLINE, etc.)
+  |  OpenAI Chat Completions format
+  v
+codex-openai-proxy
+  |  ChatGPT Responses API format
+  v
+ChatGPT Backend
+```
+
+All requests and responses are transparently converted between the two formats. Streaming is fully supported via SSE.
 
 ## Features
 
-- ✅ **OpenAI API Compatibility**: Accepts standard OpenAI Chat Completions requests
-- ✅ **ChatGPT Plus Integration**: Uses your existing ChatGPT Plus tokens  
-- ✅ **Cloudflare Bypass**: Handles ChatGPT's Cloudflare protection with browser-like headers
-- ✅ **HTTPS Support**: Works with extensions requiring secure connections (via ngrok)
-- ✅ **Streaming Responses**: Full streaming support for real-time responses
-- ✅ **CLINE Compatible**: Tested extensively with CLINE VS Code extension
-- ✅ **Array Content Support**: Handles both string and array message formats from OpenAI SDK
-- ✅ **Universal Routing**: Bulletproof request routing that bypasses complex warp conflicts
+- OpenAI Chat Completions API-compatible interface
+- Authentication via ChatGPT Plus `access_token` or standard OpenAI `api_key`
+- Cloudflare bypass using browser-grade request headers
+- Full streaming support (Server-Sent Events)
+- Handles both string and array content formats in messages
+- Tested with CLINE VS Code extension
 
-## Quick Start
+## Installation
 
-### 1. Build and Run
+### Pre-built Binaries
+
+Linux x86_64:
 
 ```bash
-git clone https://github.com/Securiteru/codex-openai-proxy.git
+curl -fsSL https://github.com/masloffvs/codex-openai-proxy/releases/latest/download/codex-openai-proxy-x86_64-unknown-linux-gnu.tar.gz | tar -xz
+chmod +x ./codex-openai-proxy
+./codex-openai-proxy --port 8888 --auth-path ~/.codex/auth.json
+```
+
+macOS and Windows binaries are available on the [releases page](https://github.com/masloffvs/codex-openai-proxy/releases/latest). Release assets are published automatically for tags matching `v*`.
+
+### Building from Source
+
+```bash
+git clone https://github.com/masloffvs/codex-openai-proxy.git
 cd codex-openai-proxy
 cargo build --release
 ./target/release/codex-openai-proxy --port 8888 --auth-path ~/.codex/auth.json
 ```
 
-### 2. Setup HTTPS Tunnel (Required for CLINE)
+## Configuration
 
-Most VS Code extensions require HTTPS:
+### CLI Reference
+
+```
+codex-openai-proxy [OPTIONS]
+
+Options:
+  -p, --port <PORT>          Port to listen on [default: 8080]
+      --auth-path <PATH>     Path to Codex auth.json [default: ~/.codex/auth.json]
+  -h, --help                 Print help
+  -v, --version              Print version
+```
+
+### Authentication
+
+The proxy reads credentials from the Codex `auth.json` file:
+
+```json
+{
+  "access_token": "eyJ...",
+  "account_id": "db1fc050-5df3-42c1-be65-9463d9d23f0b",
+  "api_key": "sk-proj-..."
+}
+```
+
+**Resolution order:** If both `access_token` and `account_id` are present, the proxy authenticates as a ChatGPT Plus account. Otherwise it falls back to `api_key` for standard OpenAI API access.
+
+## API
+
+### `GET /health`
+
+Returns service status. Use this to verify the proxy is running.
+
+### `POST /v1/chat/completions`
+
+OpenAI-compatible chat completions endpoint. Also accessible at `/chat/completions`.
+
+**Supported parameters:** `messages`, `model`, `temperature`, `max_tokens`, `stream`, `tools`.
+
+**Request example:**
+
+```json
+{
+  "model": "gpt-5",
+  "messages": [{ "role": "user", "content": "Hello!" }]
+}
+```
+
+This is internally converted to a Responses API payload:
+
+```json
+{
+  "model": "gpt-5",
+  "instructions": "You are a helpful AI assistant.",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [{ "type": "input_text", "text": "Hello!" }]
+    }
+  ],
+  "tools": [],
+  "tool_choice": "auto",
+  "store": false,
+  "stream": false
+}
+```
+
+The response from ChatGPT is then converted back to the standard Chat Completions format before being returned to the client.
+
+## Usage with CLINE
+
+CLINE (and most VS Code AI extensions) requires an HTTPS endpoint. Use an ngrok tunnel to expose the proxy:
 
 ```bash
-# Install ngrok and create your own static domain at https://dashboard.ngrok.com/domains
-# Replace 'your-static-domain' with your unique domain name
+# Create a static domain at https://dashboard.ngrok.com/domains first
 ngrok http 8888 --domain=your-static-domain.ngrok-free.app
 ```
 
-**Security Note**: Always use your own unique ngrok domain. Do not share your domain publicly to prevent unauthorized access to your proxy.
+> **Security:** Use a unique ngrok domain and do not share it publicly. Anyone with access to the domain can make requests through your proxy.
 
-### 3. Configure CLINE Extension
+Then configure CLINE in VS Code:
 
-In VS Code CLINE settings:
-- **Base URL**: `https://your-static-domain.ngrok-free.app`
-- **Model**: `gpt-5` (or `gpt-4`)
-- **API Key**: Any value (not used, but required by extension)
+| Setting  | Value                                             |
+| -------- | ------------------------------------------------- |
+| Base URL | `https://your-static-domain.ngrok-free.app`       |
+| Model    | `gpt-5` (or `gpt-4`)                              |
+| API Key  | Any non-empty string (not validated by the proxy) |
 
-### 4. Test Connection
+### Verify the Connection
 
 ```bash
 # Health check
@@ -65,114 +156,35 @@ curl -X POST https://your-static-domain.ngrok-free.app/chat/completions \
   }'
 ```
 
-## How It Works
-
-### Request Flow
-
-1. **CLINE** → Chat Completions format → **Proxy**
-2. **Proxy** → Converts to Responses API → **ChatGPT Backend**
-3. **ChatGPT Backend** → Responses API format → **Proxy**
-4. **Proxy** → Converts to Chat Completions → **CLINE**
-
-### Format Conversion
-
-**Chat Completions Request:**
-```json
-{
-  "model": "gpt-5",
-  "messages": [
-    {"role": "user", "content": "Hello!"}
-  ]
-}
-```
-
-**Responses API Request:**
-```json
-{
-  "model": "gpt-5", 
-  "instructions": "You are a helpful AI assistant.",
-  "input": [
-    {
-      "type": "message",
-      "role": "user", 
-      "content": [{"type": "input_text", "text": "Hello!"}]
-    }
-  ],
-  "tools": [],
-  "tool_choice": "auto",
-  "store": false,
-  "stream": false
-}
-```
-
-## Configuration
-
-### Command Line Options
-
-```bash
-codex-openai-proxy [OPTIONS]
-
-Options:
-  -p, --port <PORT>          Port to listen on [default: 8080]
-      --auth-path <PATH>     Path to Codex auth.json [default: ~/.codex/auth.json]
-  -h, --help                 Print help
-  -v, --version              Print version
-```
-
-### Authentication
-
-The proxy automatically reads authentication from your Codex `auth.json` file:
-
-```json
-{
-  "access_token": "eyJ...",
-  "account_id": "db1fc050-5df3-42c1-be65-9463d9d23f0b",
-  "api_key": "sk-proj-..."
-}
-```
-
-**Priority**: Uses `access_token` + `account_id` for ChatGPT Plus accounts, falls back to `api_key` for standard OpenAI accounts.
-
-## API Endpoints
-
-### Health Check
-- **GET** `/health`
-- Returns service status
-
-### Chat Completions
-- **POST** `/v1/chat/completions`
-- OpenAI-compatible chat completions endpoint
-- Supports: messages, model, temperature, max_tokens, stream, tools
-
 ## Troubleshooting
 
-### Common Issues
+### Connection refused
 
-**Connection Refused:**
+Ensure the proxy process is running and the port matches:
+
 ```bash
-# Check if proxy is running
 curl http://localhost:8080/health
 ```
 
-**Authentication Errors:**
+### Authentication errors
+
+Verify that `auth.json` exists and contains valid tokens:
+
 ```bash
-# Verify auth.json exists and has valid tokens
 cat ~/.codex/auth.json | jq .
 ```
 
-**Backend Errors:**
+### Debugging
+
+Run the proxy with verbose logging to inspect request/response details:
+
 ```bash
-# Check proxy logs for detailed error messages
-RUST_LOG=debug cargo run
+RUST_LOG=debug cargo run -- --port 8080
 ```
 
-### Debug Mode
+Test with verbose curl output:
 
 ```bash
-# Run with debug logging
-RUST_LOG=debug cargo run -- --port 8080
-
-# Test with verbose curl
 curl -v -X POST http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "gpt-5", "messages": [{"role": "user", "content": "Test"}]}'
@@ -180,23 +192,20 @@ curl -v -X POST http://localhost:8080/v1/chat/completions \
 
 ## Development
 
-### Building
-
 ```bash
-cargo build
-cargo test
-cargo clippy
-cargo fmt
+cargo build          # compile
+cargo test           # run tests
+cargo clippy         # lint
+cargo fmt            # format
 ```
 
-### Adding Features
+### Project Structure
 
-The proxy is designed to be extensible:
+- **`main.rs`** — HTTP server, route definitions, request handling
+- **Format conversion** — functions translating between Chat Completions and Responses API schemas
+- **`AuthData`** — authentication configuration and token resolution
 
-- **New endpoints**: Add routes in `main.rs`
-- **Format conversion**: Modify conversion functions
-- **Authentication**: Extend `AuthData` structure
-- **Streaming**: Add SSE support for real-time responses
+The codebase is intentionally small and straightforward to extend. New endpoints are added as routes in `main.rs`; format translation logic is isolated in dedicated conversion functions.
 
 ## License
 
