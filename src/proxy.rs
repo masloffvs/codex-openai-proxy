@@ -37,6 +37,7 @@ impl ProxyServer {
 
     fn convert_chat_to_responses(&self, chat_req: ChatCompletionsRequest) -> ResponsesApiRequest {
         let mut input = Vec::new();
+        let mut system_parts: Vec<String> = Vec::new();
 
         for msg in chat_req.messages {
             let content_text = match &msg.content {
@@ -58,6 +59,14 @@ impl ProxyServer {
                 _ => msg.content.to_string(),
             };
 
+            // System messages go into `instructions`, not `input`
+            if msg.role == "system" || msg.role == "developer" {
+                if !content_text.is_empty() {
+                    system_parts.push(content_text);
+                }
+                continue;
+            }
+
             input.push(ResponseItem::Message {
                 id: None,
                 role: msg.role,
@@ -65,7 +74,18 @@ impl ProxyServer {
             });
         }
 
-        let instructions = "You are a helpful AI assistant. Provide clear, accurate, and concise responses to user questions and requests.".to_string();
+        let instructions = if system_parts.is_empty() {
+            "You are a helpful AI assistant.".to_string()
+        } else {
+            system_parts.join("\n\n")
+        };
+
+        info!(
+            target: "proxy",
+            "convert.instructions length={} input_messages={}",
+            instructions.len(),
+            input.len()
+        );
 
         ResponsesApiRequest {
             model: chat_req.model,
